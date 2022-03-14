@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
-OPENSSL_VERSION="3.0.1"
+OPENSSL_VERSION="1.1.1m"
 
 mkdir -p deps
 mkdir -p deps/include
@@ -18,22 +18,3 @@ cp -fr include ../../deps
 cp libcrypto.a ../../deps/lib
 cp libssl.a ../../deps/lib
 cd ..
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
