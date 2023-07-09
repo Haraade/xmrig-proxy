@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
-UV_VERSION="1.44.2"
+UV_VERSION="1.46.0"
 
 mkdir -p deps
 mkdir -p deps/include
