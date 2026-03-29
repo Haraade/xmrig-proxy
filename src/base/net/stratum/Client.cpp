@@ -1,7 +1,7 @@
 /* XMRig
  * Copyright (c) 2019      jtgrassie   <https://github.com/jtgrassie>
- * Copyright (c) 2018-2021 SChernykh   <https://github.com/SChernykh>
- * Copyright (c) 2016-2021 XMRig       <https://github.com/xmrig>, <support@xmrig.com>
+ * Copyright (c) 2018-2024 SChernykh   <https://github.com/SChernykh>
+ * Copyright (c) 2016-2024 XMRig       <https://github.com/xmrig>, <support@xmrig.com>
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -42,13 +42,14 @@
 #include "base/io/json/JsonRequest.h"
 #include "base/io/log/Log.h"
 #include "base/kernel/interfaces/IClientListener.h"
+#include "base/kernel/Platform.h"
 #include "base/net/dns/Dns.h"
 #include "base/net/dns/DnsRecords.h"
 #include "base/net/stratum/Socks5.h"
 #include "base/net/tools/NetBuffer.h"
 #include "base/tools/Chrono.h"
-#include "base/tools/Cvt.h"
 #include "base/tools/cryptonote/BlobReader.h"
+#include "base/tools/Cvt.h"
 #include "net/JobResult.h"
 
 
@@ -80,7 +81,7 @@ xmrig::Client::Client(int id, const char *agent, IClientListener *listener) :
     BaseClient(id, listener),
     m_agent(agent),
     m_sendBuf(1024),
-    m_tempBuf(256)
+    m_tempBuf(320)
 {
     m_reader.setListener(this);
     m_key = m_storage.add(this);
@@ -198,12 +199,17 @@ int64_t xmrig::Client::submit(const JobResult &result)
     char *nonce = m_tempBuf.data();
     char *data  = m_tempBuf.data() + 16;
     char *signature = m_tempBuf.data() + 88;
+    char *commitment = m_tempBuf.data() + 224;
 
     Cvt::toHex(nonce, sizeof(uint32_t) * 2 + 1, reinterpret_cast<const uint8_t *>(&result.nonce), sizeof(uint32_t));
     Cvt::toHex(data, 65, result.result(), 32);
 
     if (result.minerSignature()) {
         Cvt::toHex(signature, 129, result.minerSignature(), 64);
+    }
+
+    if (result.commitment()) {
+        Cvt::toHex(commitment, 65, result.commitment(), 32);
     }
 #   endif
 
@@ -223,6 +229,16 @@ int64_t xmrig::Client::submit(const JobResult &result)
 #   else
     if (result.sig) {
         params.AddMember("sig", StringRef(result.sig), allocator);
+    }
+#   endif
+
+#   ifndef XMRIG_PROXY_PROJECT
+    if (result.commitment()) {
+        params.AddMember("commitment", StringRef(commitment), allocator);
+    }
+#   else
+    if (result.commitment) {
+        params.AddMember("commitment", StringRef(result.commitment), allocator);
     }
 #   endif
 
@@ -343,6 +359,9 @@ bool xmrig::Client::close()
     setState(ClosingState);
 
     if (uv_is_closing(reinterpret_cast<uv_handle_t*>(m_socket)) == 0) {
+        if (Platform::hasKeepalive()) {
+            uv_tcp_keepalive(m_socket, 0, 60);
+        }
         uv_close(reinterpret_cast<uv_handle_t*>(m_socket), Client::onClose);
     }
 
@@ -359,7 +378,7 @@ bool xmrig::Client::parseJob(const rapidjson::Value &params, int *code)
 
     Job job(has<EXT_NICEHASH>(), m_pool.algorithm(), m_rpcId);
 
-    if (!job.setId(params["job_id"].GetString())) {
+    if (!job.setId(Json::getString(params, "job_id"))) {
         *code = 3;
         return false;
     }
@@ -396,7 +415,7 @@ bool xmrig::Client::parseJob(const rapidjson::Value &params, int *code)
         }
     }
 
-    if (!job.setTarget(params["target"].GetString())) {
+    if (!job.setTarget(Json::getString(params, "target"))) {
         *code = 5;
         return false;
     }
@@ -550,6 +569,7 @@ int64_t xmrig::Client::send(size_t size)
     }
 
     m_expire = Chrono::steadyMSecs() + kResponseTimeout;
+    startTimeout();
     return m_sequence++;
 }
 
@@ -567,9 +587,9 @@ void xmrig::Client::connect(const sockaddr *addr)
     uv_tcp_init(uv_default_loop(), m_socket);
     uv_tcp_nodelay(m_socket, 1);
 
-#   ifndef WIN32
-    uv_tcp_keepalive(m_socket, 1, 60);
-#   endif
+    if (Platform::hasKeepalive()) {
+        uv_tcp_keepalive(m_socket, 1, 60);
+    }
 
     uv_tcp_connect(req, m_socket, addr, onConnect);
 }
@@ -585,7 +605,7 @@ void xmrig::Client::handshake()
     if (isTLS()) {
         m_expire = Chrono::steadyMSecs() + kResponseTimeout;
 
-        m_tls->handshake();
+        m_tls->handshake(m_pool.isSNI() ? m_pool.host().data() : nullptr);
     }
     else
 #   endif
@@ -605,7 +625,7 @@ bool xmrig::Client::parseLogin(const rapidjson::Value &result, int *code)
 
     parseExtensions(result);
 
-    const bool rc = parseJob(result["job"], code);
+    const bool rc = parseJob(Json::getObject(result, "job"), code);
     m_jobs = 0;
 
     return rc;
@@ -657,8 +677,6 @@ void xmrig::Client::onClose()
 
 void xmrig::Client::parse(char *line, size_t len)
 {
-    startTimeout();
-
     LOG_DEBUG("[%s] received (%d bytes): \"%.*s\"", url(), len, static_cast<int>(len), line);
 
     if (len < 22 || line[0] != '{') {
@@ -840,7 +858,7 @@ void xmrig::Client::parseResponse(int64_t id, const rapidjson::Value &result, co
         m_listener->onLoginSuccess(this);
 
         if (m_job.isValid()) {
-            m_listener->onJobReceived(this, m_job, result["job"]);
+            m_listener->onJobReceived(this, m_job, Json::getObject(result, "job"));
         }
 
         return;
@@ -853,8 +871,6 @@ void xmrig::Client::parseResponse(int64_t id, const rapidjson::Value &result, co
 void xmrig::Client::ping()
 {
     send(snprintf(m_sendBuf.data(), m_sendBuf.size(), "{\"id\":%" PRId64 ",\"jsonrpc\":\"2.0\",\"method\":\"keepalived\",\"params\":{\"id\":\"%s\"}}\n", m_sequence, m_rpcId.data()));
-
-    m_keepAlive = 0;
 }
 
 
